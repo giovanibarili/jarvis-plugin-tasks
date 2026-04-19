@@ -140,16 +140,21 @@ export class TaskManagerPiece implements Piece {
   private recomputeBlocked(taskId: string): void {
     const task = this.tasks.get(taskId);
     if (!task) return;
+
     if (task.blockedBy.length > 0) {
-      // Only auto-block if all blockers are still incomplete
+      // Auto-block if any blocker is still incomplete
       const anyIncomplete = task.blockedBy.some(bId => {
         const blocker = this.tasks.get(bId);
         return blocker && blocker.status !== "completed";
       });
-      if (anyIncomplete && task.status === "pending") {
+      if (anyIncomplete && (task.status === "pending" || task.status === "blocked")) {
         task.status = "blocked";
         task.updatedAt = this.now();
       }
+    } else if (task.status === "blocked") {
+      // No blockers left — unblock
+      task.status = "pending";
+      task.updatedAt = this.now();
     }
   }
 

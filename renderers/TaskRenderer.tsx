@@ -1,8 +1,7 @@
 // renderers/TaskRenderer.tsx
-// HUD panel showing task progress with status icons and progress bar.
-
-const { createElement, Fragment, useState, useMemo } = window.__JARVIS_REACT!;
-const { useHudPiece } = window.__JARVIS_HUD_HOOKS ?? {};
+// HUD panel showing task progress with tree view — active task as parent,
+// pending/blocked as children in sequence.
+// React hooks are injected by esbuild banner via window.__JARVIS_REACT.
 
 interface Task {
   id: string;
@@ -37,13 +36,6 @@ const STATUS_ICON: Record<string, string> = {
   blocked: "🚫",
 };
 
-const STATUS_ORDER: Record<string, number> = {
-  in_progress: 0,
-  blocked: 1,
-  pending: 2,
-  completed: 3,
-};
-
 const PRIORITY_COLOR: Record<string, string> = {
   critical: "#ef4444",
   high: "#f59e0b",
@@ -53,6 +45,81 @@ const PRIORITY_COLOR: Record<string, string> = {
 
 type FilterStatus = "all" | "pending" | "in_progress" | "completed" | "blocked";
 
+// ─── Tree building ───────────────────────────────────────────
+
+interface TreeNode {
+  task: Task;
+  children: TreeNode[];
+}
+
+function buildTree(tasks: Task[]): TreeNode[] {
+  // Active tasks (in_progress) are roots.
+  // Their children are: tasks that are blocked by them (direct),
+  // plus pending tasks in creation order (the "sequence").
+  // Completed and standalone tasks are also roots.
+
+  const active = tasks.filter(t => t.status === "in_progress");
+  const blocked = tasks.filter(t => t.status === "blocked");
+  const pending = tasks.filter(t => t.status === "pending");
+  const completed = tasks.filter(t => t.status === "completed");
+
+  const claimed = new Set<string>();
+  const roots: TreeNode[] = [];
+
+  // For each active task, find children:
+  // 1. Tasks blocked by this task (they list this task's id in blockedBy)
+  // 2. Remaining pending tasks (sequence after the active)
+  for (const act of active) {
+    const children: TreeNode[] = [];
+
+    // Pending tasks are the sequence
+    for (const p of pending) {
+      if (!claimed.has(p.id)) {
+        claimed.add(p.id);
+        children.push({ task: p, children: [] });
+      }
+    }
+
+    // Blocked tasks that depend on this active task
+    for (const b of blocked) {
+      if (b.blockedBy.includes(act.id) && !claimed.has(b.id)) {
+        claimed.add(b.id);
+        children.push({ task: b, children: [] });
+      }
+    }
+
+    claimed.add(act.id);
+    roots.push({ task: act, children });
+  }
+
+  // Remaining blocked tasks (not claimed by any active) — as roots
+  for (const b of blocked) {
+    if (!claimed.has(b.id)) {
+      claimed.add(b.id);
+      roots.push({ task: b, children: [] });
+    }
+  }
+
+  // Remaining pending tasks (no active parent) — as roots
+  for (const p of pending) {
+    if (!claimed.has(p.id)) {
+      claimed.add(p.id);
+      roots.push({ task: p, children: [] });
+    }
+  }
+
+  // Completed tasks — at the bottom
+  for (const c of completed) {
+    if (!claimed.has(c.id)) {
+      roots.push({ task: c, children: [] });
+    }
+  }
+
+  return roots;
+}
+
+// ─── Render ──────────────────────────────────────────────────
+
 export default function TaskRenderer({ state }: { state: any }) {
   const piece = useHudPiece?.(state.id);
   const data: TaskData = (piece?.data ?? state.data) as TaskData;
@@ -61,10 +128,15 @@ export default function TaskRenderer({ state }: { state: any }) {
   const tasks = data?.tasks ?? [];
   const summary = data?.summary ?? { total: 0, pending: 0, in_progress: 0, completed: 0, blocked: 0 };
 
-  const sorted = useMemo(() => {
-    let filtered = filter === "all" ? tasks : tasks.filter(t => t.status === filter);
-    return [...filtered].sort((a, b) => (STATUS_ORDER[a.status] ?? 9) - (STATUS_ORDER[b.status] ?? 9));
+  const tree = useMemo(() => {
+    const filtered = filter === "all" ? tasks : tasks.filter(t => t.status === filter);
+    return buildTree(filtered);
   }, [tasks, filter]);
+
+  const multipleOwners = useMemo(() => {
+    const sessions = new Set(tasks.map(t => t.sessionId));
+    return sessions.size > 1;
+  }, [tasks]);
 
   const pct = summary.total > 0 ? Math.round((summary.completed / summary.total) * 100) : 0;
 
@@ -93,32 +165,72 @@ export default function TaskRenderer({ state }: { state: any }) {
       summary.completed > 0 && chipEl("completed", `✅ ${summary.completed}`, filter, setFilter),
     ),
 
-    // ── Task list ──
+    // ── Task tree ──
     createElement("div", { style: styles.list },
-      sorted.map(t =>
-        createElement("div", { key: t.id, style: styles.taskRow },
-          createElement("span", { style: styles.icon }, STATUS_ICON[t.status]),
-          createElement("div", { style: styles.taskBody },
-            createElement("div", { style: styles.taskSubject },
-              createElement("span", null, t.subject),
-              t.priority !== "medium" &&
-                createElement("span", {
-                  style: { ...styles.priorityBadge, color: PRIORITY_COLOR[t.priority] }
-                }, t.priority),
-            ),
-            createElement("div", { style: styles.taskMeta },
-              t.sessionId !== "main" &&
-                createElement("span", { style: styles.sessionTag }, t.sessionId),
-              t.blockedBy.length > 0 &&
-                createElement("span", { style: styles.blockedTag },
-                  `blocked by: ${t.blockedBy.join(", ")}`
-                ),
-            ),
-          ),
-          createElement("span", { style: styles.taskId }, t.id),
-        ),
-      ),
+      tree.map(node => renderNode(node, tasks, multipleOwners)),
     ),
+  );
+}
+
+function renderNode(node: TreeNode, allTasks: Task[], showSession: boolean): any {
+  const t = node.task;
+  const hasChildren = node.children.length > 0;
+
+  return createElement("div", { key: t.id, style: styles.treeGroup },
+    // Parent row
+    renderTaskRow(t, allTasks, false, showSession),
+    // Children
+    hasChildren && createElement("div", { style: styles.childrenContainer },
+      node.children.map((child, i) => {
+        const isLast = i === node.children.length - 1;
+        return createElement("div", { key: child.task.id, style: styles.childRow },
+          // Tree connector
+          createElement("div", { style: styles.connector },
+            createElement("span", { style: styles.connectorChar }, isLast ? "└── " : "├── "),
+          ),
+          // Child task (compact)
+          renderTaskRow(child.task, allTasks, true, showSession),
+        );
+      }),
+    ),
+  );
+}
+
+function renderTaskRow(t: Task, allTasks: Task[], isChild: boolean, showSession: boolean = false): any {
+  return createElement("div", {
+    style: {
+      ...styles.taskRow,
+      ...(isChild ? styles.taskRowChild : {}),
+      ...(t.status === "in_progress" ? styles.taskRowActive : {}),
+    }
+  },
+    createElement("span", { style: styles.icon }, STATUS_ICON[t.status]),
+    createElement("div", { style: styles.taskBody },
+      // Session tag above title
+      showSession &&
+        createElement("span", { style: styles.sessionTag },
+          t.sessionId === "main" ? "jarvis" : t.sessionId.replace("actor-", "🤖 ")),
+      createElement("div", { style: styles.taskSubject },
+        createElement("span", null, t.subject),
+        t.priority !== "medium" &&
+          createElement("span", {
+            style: { ...styles.priorityBadge, color: PRIORITY_COLOR[t.priority] }
+          }, t.priority),
+      ),
+      t.description &&
+        createElement("div", { style: styles.taskDescription }, t.description),
+      // Blockers
+      t.blockedBy.length > 0 &&
+        createElement("div", { style: styles.taskMeta },
+          createElement("span", { style: styles.blockedTag },
+            `blocked by: ${t.blockedBy.map(id => {
+              const blocker = allTasks.find(bt => bt.id === id);
+              return blocker ? blocker.subject : id;
+            }).join(", ")}`
+          ),
+        ),
+    ),
+    createElement("span", { style: styles.taskId }, t.id),
   );
 }
 
@@ -141,7 +253,7 @@ function chipEl(
 
 // ─── Styles ───────────────────────────────────────────────────
 
-const styles: Record<string, React.CSSProperties> = {
+const styles: Record<string, any> = {
   container: {
     display: "flex",
     flexDirection: "column",
@@ -210,10 +322,41 @@ const styles: Record<string, React.CSSProperties> = {
   list: {
     display: "flex",
     flexDirection: "column",
-    gap: "4px",
+    gap: "2px",
     overflowY: "auto",
     flex: 1,
   },
+
+  // Tree
+  treeGroup: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "0px",
+    marginBottom: "4px",
+  },
+  childrenContainer: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "0px",
+    marginLeft: "6px",
+  },
+  childRow: {
+    display: "flex",
+    alignItems: "flex-start",
+  },
+  connector: {
+    flexShrink: 0,
+    width: "28px",
+    paddingTop: "6px",
+  },
+  connectorChar: {
+    fontFamily: "monospace",
+    fontSize: "12px",
+    color: "#444",
+    whiteSpace: "pre",
+  },
+
+  // Task row
   taskRow: {
     display: "flex",
     alignItems: "flex-start",
@@ -221,7 +364,16 @@ const styles: Record<string, React.CSSProperties> = {
     padding: "6px 8px",
     borderRadius: "6px",
     backgroundColor: "#1e1e1e",
+    flex: 1,
   },
+  taskRowChild: {
+    backgroundColor: "#191919",
+    padding: "4px 8px",
+  },
+  taskRowActive: {
+    borderLeft: "2px solid #8b5cf6",
+  },
+
   icon: { fontSize: "14px", lineHeight: "20px", flexShrink: 0 },
   taskBody: { flex: 1, minWidth: 0 },
   taskSubject: {
@@ -233,7 +385,17 @@ const styles: Record<string, React.CSSProperties> = {
   priorityBadge: {
     fontSize: "10px",
     fontWeight: 600,
-    textTransform: "uppercase" as const,
+    textTransform: "uppercase",
+  },
+  taskDescription: {
+    fontSize: "11px",
+    color: "#888",
+    marginTop: "2px",
+    lineHeight: "16px",
+    display: "-webkit-box",
+    WebkitLineClamp: 2,
+    WebkitBoxOrient: "vertical",
+    overflow: "hidden",
   },
   taskMeta: {
     display: "flex",
@@ -243,10 +405,13 @@ const styles: Record<string, React.CSSProperties> = {
     marginTop: "2px",
   },
   sessionTag: {
+    display: "inline-block",
     backgroundColor: "#2a2a2a",
-    padding: "0 4px",
+    padding: "0 5px",
     borderRadius: "3px",
     color: "#888",
+    fontSize: "10px",
+    marginBottom: "2px",
   },
   blockedTag: { color: "#ef4444", fontStyle: "italic" },
   taskId: {
