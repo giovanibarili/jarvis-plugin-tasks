@@ -1,0 +1,11 @@
+{
+  "name": "jarvis-plugin-tasks",
+  "version": "0.1.0",
+  "description": "Task management with progress tracking — in-memory, per-session, with global visibility",
+  "author": "giovanibarili",
+  "entry": "pieces/index.ts",
+  "capabilities": {
+    "pieces": true,
+    "renderers": true
+  }
+}
