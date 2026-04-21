@@ -54,12 +54,23 @@ export class TaskManagerPiece implements Piece {
     this.ctx = ctx;
   }
 
+  private unsubRemove?: () => void;
+
   async start(bus: EventBus): Promise<void> {
     this.bus = bus;
     this.registerCapabilities();
+
+    // When the panel is closed (removed from HUD), reset addedToHud so the
+    // next publishToHud uses "add" (upsert) to re-create the component.
+    this.unsubRemove = this.bus.subscribe("hud.update", (msg: any) => {
+      if (msg.action === "remove" && msg.pieceId === this.id && msg.source !== this.id) {
+        this.addedToHud = false;
+      }
+    });
   }
 
   async stop(): Promise<void> {
+    this.unsubRemove?.();
     if (this.addedToHud) {
       this.bus.publish({
         channel: "hud.update",
@@ -167,13 +178,14 @@ export class TaskManagerPiece implements Piece {
       summary,
     };
 
-    const action = this.addedToHud ? "update" : "add";
+    // Always use "add" — ensures the panel re-appears after the user closes it.
+    // HudState treats "add" on an existing pieceId as an upsert.
     this.addedToHud = true;
 
     this.bus.publish({
       channel: "hud.update",
       source: this.id,
-      action,
+      action: "add",
       pieceId: this.id,
       piece: {
         pieceId: this.id,
