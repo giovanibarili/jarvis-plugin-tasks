@@ -15,7 +15,7 @@ Track multi-step work with dependencies, priorities, and automatic blocker resol
 
 ## Requirements
 
-- **JARVIS** ≥ 0.2.0 (`@jarvis/core` ≥ 0.2.0)
+- **JARVIS** ≥ 0.1.0 (`@jarvis/core` ≥ 0.1.0)
 
 ## Installation
 
