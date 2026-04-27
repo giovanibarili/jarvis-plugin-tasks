@@ -174,23 +174,27 @@
 
 ---
 
-## Scenario 18: System context includes active tasks
+## Scenario 18: System context is always empty (no prompt injection)
 
-**Given** no tasks exist
-**And** I create task A with status "in_progress" (subject: "Build API")
-**And** I create task B (subject: "Write docs", default pending)
-**When** I inspect systemContext() via `jarvis_eval`
-**Then** it includes `<tasks-status>` block
-**And** shows summary line with counts (total 2, 1 in_progress, 1 pending)
-**And** lists both tasks with icons and IDs
+**Given** main has 2 tasks: A (in_progress, "Build API") and B (pending, "Write docs")
+**And** actor "alice" has 1 task C
+**When** I inspect `systemContext("main")` via `jarvis_eval`
+**Then** it returns empty string (`""`)
+**When** I inspect `systemContext("actor-alice")` or `systemContext()` (no arg)
+**Then** both return empty string
+**Rationale:** the plugin never injects task state into the prompt — the LLM discovers tasks via `task_list`/`task_get` on demand. Keeps BP1 cache hot and prevents cross-session leaks.
 
 ---
 
-## Scenario 19: System context is empty when no tasks
+## Scenario 19: System context stays empty regardless of state
 
-**Given** no tasks exist
-**When** I inspect systemContext() via `jarvis_eval`
+**Given** zero tasks
+**When** I inspect `systemContext("main")` via `jarvis_eval`
 **Then** it returns empty string
+
+**Given** 50 tasks across 5 sessions
+**When** I inspect `systemContext("main")` via `jarvis_eval`
+**Then** it still returns empty string
 
 ---
 
@@ -265,3 +269,137 @@
 **Then** each task shows a session tag:
   - "jarvis" for tasks from main session
   - "🤖 tester" for tasks from the actor session
+
+---
+
+## Scenario 27: task_clear is scoped to the calling session
+
+**Given** main has 2 completed tasks (A, B)
+**And** an actor "alice" has 1 completed task (C)
+**When** main calls `task_clear` (no params)
+**Then** A and B are removed
+**And** C is still present (different session — untouched)
+**And** the response includes `sessionId: "main"`
+
+---
+
+## Scenario 28: task_delete refuses cross-session deletion
+
+**Given** an actor "alice" owns task X (session "actor-alice")
+**When** main calls `task_delete` with id=X.id
+**Then** success is false
+**And** error mentions "belongs to session \"actor-alice\""
+**And** task X is still present
+
+---
+
+## Scenario 29: task_update refuses cross-session edits
+
+**Given** an actor "alice" owns task X with subject "original"
+**When** main calls `task_update` with id=X.id, subject="hacked"
+**Then** success is false
+**And** error mentions "belongs to session \"actor-alice\""
+**And** X.subject is still "original"
+
+---
+
+## Scenario 30: task_clear all=true still respects session scope
+
+**Given** main has 1 pending task (A) and 1 completed task (B)
+**And** an actor "alice" has 1 pending task (C)
+**When** main calls `task_clear` with all=true
+**Then** A and B are removed (both statuses, main session)
+**And** C is still present (different session — untouched)
+
+---
+
+## Scenario 31: HUD route — POST /plugins/tasks/create
+
+**Given** no tasks exist
+**When** I `curl -X POST http://localhost:<PORT>/plugins/tasks/create -H 'Content-Type: application/json' -d '{"sessionId":"actor-bob","subject":"From HUD"}'`
+**Then** response is `{ ok: true, task: { ... } }` with `task.sessionId === "actor-bob"`
+**And** the HUD panel shows the new task under the "🤖 bob" group
+
+---
+
+## Scenario 32: HUD route — POST /plugins/tasks/delete/<id> bypasses owner-check
+
+**Given** an actor "alice" owns task X (created via actor_dispatch)
+**When** I `curl -X POST http://localhost:<PORT>/plugins/tasks/delete/<X.id>`
+**Then** response is `{ ok: true, deleted: <X.id> }`
+**And** the task is gone (HUD route bypasses the LLM owner-only rule — the human user can edit any session)
+
+---
+
+## Scenario 33: HUD route — POST /plugins/tasks/clear-session/<sid>
+
+**Given** main has 2 completed tasks
+**And** actor "alice" has 1 completed task
+**When** I `curl -X POST http://localhost:<PORT>/plugins/tasks/clear-session/actor-alice`
+**Then** response is `{ ok: true, removed: 1, sessionId: "actor-alice", all: false }`
+**And** main's tasks are intact; alice's completed task is gone
+
+---
+
+## Scenario 34: HUD route — POST /plugins/tasks/clear-session/<sid>?all=true
+
+**Given** actor "alice" has 1 pending and 1 completed task
+**When** I `curl -X POST 'http://localhost:<PORT>/plugins/tasks/clear-session/actor-alice?all=true'`
+**Then** all of alice's tasks are removed regardless of status
+
+---
+
+## Scenario 35: HUD renderer — session groups with collapse (visual)
+
+**Given** tasks exist from at least 2 sessions (main + actor "alice")
+**When** I take a screenshot
+**Then** the panel shows two grouped sections, each with:
+  - chevron (▾ expanded / ▸ collapsed) + session label + active/total count
+  - clear-completed button (🗑) only when the group has completed tasks
+**When** I click the chevron of one group
+**Then** that group's tasks collapse (header still visible, body hidden)
+
+---
+
+## Scenario 36: HUD renderer — inline add (visual)
+
+**Given** at least one session group is expanded
+**When** I type text in the "Add a task…" input at the bottom of a group
+**And** I press Enter (or click the ↵ button)
+**Then** a new task is created in that session's group via POST /plugins/tasks/create
+**And** the input clears for the next entry
+
+---
+
+## Scenario 37: HUD renderer — delete row × button (visual)
+
+**Given** at least one task is rendered
+**When** I click the × button on its row
+**Then** POST /plugins/tasks/delete/<id> fires
+**And** the task disappears from the panel
+
+---
+
+## Scenario 38: HUD renderer — inline edit (visual)
+
+**Given** a task with subject "old" exists
+**When** I click the subject text
+**Then** an input replaces the subject, pre-filled with "old"
+**When** I type "new" and press Enter (or blur)
+**Then** POST /plugins/tasks/update/<id> fires with `{ subject: "new" }`
+**And** the row now shows "new"
+**When** I click again and press Escape
+**Then** the edit is cancelled with no API call
+
+---
+
+## Scenario 39: HUD renderer — status icon cycles via click (visual)
+
+**Given** a pending task
+**When** I click the status icon (⬚)
+**Then** it becomes 🔧 (in_progress) — POST /plugins/tasks/update/<id> with status="in_progress"
+**When** I click again
+**Then** it becomes ✅ (completed)
+**When** I click once more
+**Then** it cycles back to ⬚ (pending)
+**And** blocked status is read-only (clicking 🚫 does nothing)

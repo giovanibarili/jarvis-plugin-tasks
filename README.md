@@ -6,12 +6,11 @@ Track multi-step work with dependencies, priorities, and automatic blocker resol
 
 ## Features
 
-- **Per-session ownership, global visibility** — tasks belong to a session (main, actor-alice, etc.) but `task_list` returns everything across all sessions
-- **Dependency management** — `blockedBy` links between tasks; completing a blocker auto-unblocks dependents
-- **Tree view HUD** — active (in_progress) tasks render as roots, pending tasks indent below as children, blocked tasks show resolved blocker names
-- **Progress bar** — real-time completion percentage with filter chips by status
-- **Session tags** — when tasks come from multiple sessions, each row shows its owner ("jarvis" for main, "🤖 alice" for actors)
-- **System context injection** — the AI sees a `<tasks-status>` summary every turn, keeping it aware of progress without explicit queries
+- **Per-session ownership, owner-only writes** — tasks belong to a session (main, actor-alice, etc.); reads are global, but `task_update`, `task_delete`, and `task_clear` only operate on tasks owned by the calling session. The LLM cannot touch another session's list.
+- **Interactive HUD** — tasks grouped per session with collapsible headers, inline add (`+`), inline edit (click subject), per-row delete (`×`), per-group clear-completed (`🗑`), and clickable status icons that cycle ⬚ → 🔧 → ✅. The human user (operating the HUD) bypasses the owner-only rule via dedicated HTTP routes — they can manage every session's tasks.
+- **Dependency management** — `blockedBy` links between tasks; completing a blocker auto-unblocks dependents.
+- **Progress bar** — real-time completion percentage with filter chips by status.
+- **Cache-friendly** — the plugin never injects task state into the system prompt, so prompt-cache stays hot regardless of how often tasks are created or updated. The LLM discovers tasks on demand via `task_list` / `task_get`.
 
 ## Requirements
 

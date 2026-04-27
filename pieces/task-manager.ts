@@ -59,6 +59,7 @@ export class TaskManagerPiece implements Piece {
   async start(bus: EventBus): Promise<void> {
     this.bus = bus;
     this.registerCapabilities();
+    this.registerRoutes();
 
     // When the panel is closed (removed from HUD), reset addedToHud so the
     // next publishToHud uses "add" (upsert) to re-create the component.
@@ -84,30 +85,21 @@ export class TaskManagerPiece implements Piece {
 
   // ─── System context ─────────────────────────────────────────
 
-  systemContext(sessionId?: string): string {
-    const allTasks = [...this.tasks.values()];
-    if (allTasks.length === 0) return "";
-
-    const summary = this.summarize(allTasks);
-    const lines: string[] = [
-      `<tasks-status>`,
-      `Total: ${summary.total} | ✅ ${summary.completed} | 🔧 ${summary.in_progress} | ⬚ ${summary.pending} | 🚫 ${summary.blocked}`,
-    ];
-
-    // Show non-completed tasks
-    const active = allTasks.filter(t => t.status !== "completed");
-    if (active.length > 0) {
-      lines.push("");
-      for (const t of active) {
-        const icon = statusIcon(t.status);
-        const owner = t.sessionId === "main" ? "" : ` [${t.sessionId}]`;
-        const blockers = t.blockedBy.length > 0 ? ` (blocked by: ${t.blockedBy.join(", ")})` : "";
-        lines.push(`${icon} ${t.id}: ${t.subject}${owner}${blockers}`);
-      }
-    }
-
-    lines.push("</tasks-status>");
-    return lines.join("\n");
+  /**
+   * The task manager intentionally injects NOTHING into the system prompt.
+   *
+   * Why:
+   *   - Every create/update/delete would invalidate the BP1 cache, defeating
+   *     prompt-caching gains.
+   *   - Tasks are inherently per-session state; mixing them into a global
+   *     prompt fragment leaks across sessions and confuses the LLM about
+   *     what it can actually act on (writes are owner-only).
+   *
+   * The LLM discovers tasks on demand via `task_list` / `task_get`. The HUD
+   * is the canonical surface for the human user.
+   */
+  systemContext(_sessionId?: string): string {
+    return "";
   }
 
   // ─── State helpers ──────────────────────────────────────────
@@ -193,9 +185,11 @@ export class TaskManagerPiece implements Piece {
         name: this.name,
         status: "running",
         data: data as unknown as Record<string, unknown>,
-        position: { x: 50, y: 50 },
-        size: { width: 500, height: 400 },
-        ephemeral: true,
+        // Anchored panel — layout persists across restarts. Same pattern as
+        // actor-pool. Do NOT set ephemeral:true here, which would make it
+        // behave as a transient popup detached from the world map.
+        position: { x: 1240, y: 350 },
+        size: { width: 540, height: 480 },
         renderer: { plugin: "jarvis-plugin-tasks", file: "TaskRenderer" },
       },
       data: data as unknown as Record<string, unknown>,
@@ -327,6 +321,14 @@ export class TaskManagerPiece implements Piece {
         const task = this.tasks.get(id);
         if (!task) return { success: false, error: `Task ${id} not found` };
 
+        const callerSession = String(input.__sessionId ?? "main");
+        if (task.sessionId !== callerSession) {
+          return {
+            success: false,
+            error: `Task ${id} belongs to session "${task.sessionId}" — only its owner can update it.`,
+          };
+        }
+
         if (input.subject) task.subject = String(input.subject).trim();
         if (input.description !== undefined) task.description = String(input.description);
         if (validPriority(input.priority)) task.priority = validPriority(input.priority)!;
@@ -431,7 +433,9 @@ export class TaskManagerPiece implements Piece {
     // ── task_delete ──────────────────────────────────────────
     reg.register({
       name: "task_delete",
-      description: "Delete a task by ID. Also removes it from other tasks' blockedBy lists.",
+      description:
+        "Delete a task by ID. OWNERS ONLY — a session can only delete tasks it owns. " +
+        "Also removes the deleted ID from other tasks' blockedBy lists.",
       input_schema: {
         type: "object",
         properties: {
@@ -444,11 +448,30 @@ export class TaskManagerPiece implements Piece {
       },
       handler: (async (input: Record<string, unknown>) => {
         const id = String(input.id);
-        if (!this.tasks.has(id)) return { success: false, error: `Task ${id} not found` };
+        const callerSession = String(input.__sessionId ?? "main");
+
+        const task = this.tasks.get(id);
+        if (!task) return { success: false, error: `Task ${id} not found` };
+
+        if (task.sessionId !== callerSession) {
+          return {
+            success: false,
+            error: `Task ${id} belongs to session "${task.sessionId}" — only its owner can delete it.`,
+          };
+        }
 
         this.tasks.delete(id);
         // Clean up references in other tasks
         const unblocked = this.resolveBlockers(id);
+        // Also strip the deleted id from any remaining blockedBy lists
+        for (const surviving of this.tasks.values()) {
+          const before = surviving.blockedBy.length;
+          surviving.blockedBy = surviving.blockedBy.filter(b => b !== id);
+          if (surviving.blockedBy.length !== before) {
+            this.recomputeBlocked(surviving.id);
+            surviving.updatedAt = this.now();
+          }
+        }
         this.publishToHud();
 
         return {
@@ -463,36 +486,183 @@ export class TaskManagerPiece implements Piece {
     reg.register({
       name: "task_clear",
       description:
-        "Clear tasks. By default clears only 'completed' tasks. " +
-        "Pass all=true to clear everything.",
+        "Clear tasks owned by the CALLING session only. Cannot touch tasks from other sessions — " +
+        "every session manages its own list. By default clears only 'completed' tasks; " +
+        "pass all=true to clear every status (still scoped to the caller's session).",
       input_schema: {
         type: "object",
         properties: {
           all: {
             type: "boolean",
-            description: "If true, clear ALL tasks. Otherwise only completed.",
+            description: "If true, clear all statuses (not just 'completed') within the caller's session.",
           },
         },
       },
       handler: (async (input: Record<string, unknown>) => {
-        const clearAll = input.all === true;
-        let removed = 0;
+        const callerSession = String(input.__sessionId ?? "main");
+        const clearAllStatuses = input.all === true;
 
-        if (clearAll) {
-          removed = this.tasks.size;
-          this.tasks.clear();
-        } else {
-          for (const [id, task] of this.tasks) {
-            if (task.status === "completed") {
-              this.tasks.delete(id);
-              removed++;
+        let removed = 0;
+        const removedIds: string[] = [];
+
+        for (const [id, task] of this.tasks) {
+          if (task.sessionId !== callerSession) continue;
+          if (!clearAllStatuses && task.status !== "completed") continue;
+          this.tasks.delete(id);
+          removedIds.push(id);
+          removed++;
+        }
+
+        // Clean up dangling blockedBy references in surviving tasks
+        if (removedIds.length > 0) {
+          const removedSet = new Set(removedIds);
+          for (const surviving of this.tasks.values()) {
+            const before = surviving.blockedBy.length;
+            surviving.blockedBy = surviving.blockedBy.filter(b => !removedSet.has(b));
+            if (surviving.blockedBy.length !== before) {
+              this.recomputeBlocked(surviving.id);
+              surviving.updatedAt = this.now();
             }
           }
         }
 
         this.publishToHud();
-        return { success: true, removed, remaining: this.tasks.size };
+        return {
+          success: true,
+          removed,
+          remaining: this.tasks.size,
+          sessionId: callerSession,
+        };
       }) as CapabilityHandler,
+    });
+  }
+
+  // ─── HTTP Routes (HUD direct manipulation) ─────────────────
+  // These routes bypass the owner-only check enforced on capabilities,
+  // because the human user (operating the HUD) is the supreme owner of
+  // every session. The capability layer remains strict so the LLM cannot
+  // mess with tasks owned by other sessions.
+
+  private registerRoutes(): void {
+    // POST /plugins/tasks/create
+    // Body: { sessionId, subject, description?, status?, priority?, blockedBy? }
+    this.ctx.registerRoute("POST", "/plugins/tasks/create", async (req: any, res: any) => {
+      try {
+        const body = await readJsonBody(req);
+        const sessionId = String(body.sessionId ?? "main");
+        const subject = String(body.subject ?? "").trim();
+        if (!subject) {
+          return sendJson(res, 400, { ok: false, error: "subject is required" });
+        }
+        const blockedBy = Array.isArray(body.blockedBy)
+          ? (body.blockedBy as string[]).filter(bId => this.tasks.has(bId))
+          : [];
+        const status: TaskStatus = blockedBy.length > 0
+          ? "blocked"
+          : (body.status === "in_progress" ? "in_progress" : "pending");
+
+        const id = this.nextId();
+        const task: Task = {
+          id,
+          sessionId,
+          subject,
+          description: body.description ? String(body.description) : undefined,
+          status,
+          priority: validPriority(body.priority) ?? "medium",
+          blockedBy,
+          createdAt: this.now(),
+          updatedAt: this.now(),
+          metadata: {},
+        };
+        this.tasks.set(id, task);
+        this.publishToHud();
+        sendJson(res, 200, { ok: true, task: { ...task } });
+      } catch (e: any) {
+        sendJson(res, 400, { ok: false, error: String(e?.message ?? e) });
+      }
+    });
+
+    // POST /plugins/tasks/update/<id>
+    // Body: { subject?, description?, status?, priority? }
+    this.ctx.registerRoute("POST", "/plugins/tasks/update/", async (req: any, res: any) => {
+      const id = req.url?.split("/plugins/tasks/update/")[1]?.split("?")[0];
+      if (!id) return sendJson(res, 400, { ok: false, error: "Missing task id" });
+      const task = this.tasks.get(id);
+      if (!task) return sendJson(res, 404, { ok: false, error: `Task ${id} not found` });
+      try {
+        const body = await readJsonBody(req);
+        if (typeof body.subject === "string") task.subject = body.subject.trim();
+        if (body.description !== undefined) task.description = String(body.description);
+        if (validPriority(body.priority)) task.priority = validPriority(body.priority)!;
+        let unblocked: string[] = [];
+        if (body.status && body.status !== task.status) {
+          const newStatus = String(body.status) as TaskStatus;
+          task.status = newStatus;
+          if (newStatus === "completed") {
+            task.completedAt = this.now();
+            unblocked = this.resolveBlockers(id);
+          }
+        }
+        task.updatedAt = this.now();
+        this.publishToHud();
+        sendJson(res, 200, { ok: true, task: { ...task }, ...(unblocked.length ? { unblocked } : {}) });
+      } catch (e: any) {
+        sendJson(res, 400, { ok: false, error: String(e?.message ?? e) });
+      }
+    });
+
+    // POST /plugins/tasks/delete/<id>
+    this.ctx.registerRoute("POST", "/plugins/tasks/delete/", async (req: any, res: any) => {
+      const id = req.url?.split("/plugins/tasks/delete/")[1]?.split("?")[0];
+      if (!id) return sendJson(res, 400, { ok: false, error: "Missing task id" });
+      if (!this.tasks.has(id)) return sendJson(res, 404, { ok: false, error: `Task ${id} not found` });
+      this.tasks.delete(id);
+      const unblocked = this.resolveBlockers(id);
+      // Strip dangling blockedBy refs
+      for (const surviving of this.tasks.values()) {
+        const before = surviving.blockedBy.length;
+        surviving.blockedBy = surviving.blockedBy.filter(b => b !== id);
+        if (surviving.blockedBy.length !== before) {
+          this.recomputeBlocked(surviving.id);
+          surviving.updatedAt = this.now();
+        }
+      }
+      this.publishToHud();
+      sendJson(res, 200, { ok: true, deleted: id, ...(unblocked.length ? { unblocked } : {}) });
+    });
+
+    // POST /plugins/tasks/clear-session/<sessionId>?all=true
+    // Clears completed tasks of that session by default; ?all=true clears every status.
+    this.ctx.registerRoute("POST", "/plugins/tasks/clear-session/", async (req: any, res: any) => {
+      const url = req.url ?? "";
+      const tail = url.split("/plugins/tasks/clear-session/")[1] ?? "";
+      const [rawSession, query] = tail.split("?");
+      const sessionId = decodeURIComponent(rawSession ?? "");
+      if (!sessionId) return sendJson(res, 400, { ok: false, error: "Missing sessionId" });
+      const clearAll = (query ?? "").includes("all=true");
+
+      let removed = 0;
+      const removedIds: string[] = [];
+      for (const [id, task] of this.tasks) {
+        if (task.sessionId !== sessionId) continue;
+        if (!clearAll && task.status !== "completed") continue;
+        this.tasks.delete(id);
+        removedIds.push(id);
+        removed++;
+      }
+      if (removedIds.length > 0) {
+        const removedSet = new Set(removedIds);
+        for (const surviving of this.tasks.values()) {
+          const before = surviving.blockedBy.length;
+          surviving.blockedBy = surviving.blockedBy.filter(b => !removedSet.has(b));
+          if (surviving.blockedBy.length !== before) {
+            this.recomputeBlocked(surviving.id);
+            surviving.updatedAt = this.now();
+          }
+        }
+      }
+      this.publishToHud();
+      sendJson(res, 200, { ok: true, removed, sessionId, all: clearAll });
     });
   }
 }
@@ -513,4 +683,22 @@ const VALID_PRIORITIES = new Set(["low", "medium", "high", "critical"]);
 function validPriority(val: unknown): TaskPriority | null {
   if (typeof val === "string" && VALID_PRIORITIES.has(val)) return val as TaskPriority;
   return null;
+}
+
+/** Read and JSON-parse the request body. Resolves to {} on empty body. */
+function readJsonBody(req: any): Promise<any> {
+  return new Promise((resolve, reject) => {
+    let raw = "";
+    req.on("data", (chunk: Buffer) => { raw += chunk.toString(); });
+    req.on("end", () => {
+      if (!raw) return resolve({});
+      try { resolve(JSON.parse(raw)); } catch (e) { reject(e); }
+    });
+    req.on("error", reject);
+  });
+}
+
+function sendJson(res: any, status: number, body: unknown): void {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(body));
 }
