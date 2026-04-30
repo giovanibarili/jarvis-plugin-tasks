@@ -94,6 +94,8 @@ export default function TaskRenderer({ state }: { state: any }) {
   const [editing, setEditing] = useState<Record<string, string>>({});
   // add-task state per session — { sessionId: draftSubject }
   const [adding, setAdding] = useState<Record<string, string>>({});
+  // expanded description state — { taskId: true }
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
 
   const tasks = data?.tasks ?? [];
   const summary = data?.summary ?? { total: 0, pending: 0, in_progress: 0, completed: 0, blocked: 0 };
@@ -177,6 +179,8 @@ export default function TaskRenderer({ state }: { state: any }) {
           setEditing,
           adding,
           setAdding,
+          expanded,
+          setExpanded,
         }),
       ),
     ),
@@ -195,6 +199,8 @@ function SessionGroup({
   setEditing,
   adding,
   setAdding,
+  expanded,
+  setExpanded,
 }: {
   sessionId: string;
   tasks: Task[];
@@ -205,6 +211,8 @@ function SessionGroup({
   setEditing: (fn: (prev: Record<string, string>) => Record<string, string>) => void;
   adding: Record<string, string>;
   setAdding: (fn: (prev: Record<string, string>) => Record<string, string>) => void;
+  expanded: Record<string, boolean>;
+  setExpanded: (fn: (prev: Record<string, boolean>) => Record<string, boolean>) => void;
 }) {
   const completedCount = tasks.filter(t => t.status === "completed").length;
   const activeCount = tasks.length - completedCount;
@@ -254,6 +262,8 @@ function SessionGroup({
         key: t.id,
         task: t,
         allTasks,
+        descExpanded: !!expanded[t.id],
+        onToggleExpand: () => setExpanded(prev => ({ ...prev, [t.id]: !prev[t.id] })),
         editingDraft: editing[t.id],
         onStartEdit: () => setEditing(prev => ({ ...prev, [t.id]: t.subject })),
         onChangeEdit: (v: string) => setEditing(prev => ({ ...prev, [t.id]: v })),
@@ -304,10 +314,33 @@ function SessionGroup({
 
 // ─── Task row ─────────────────────────────────────────────────
 
+function DescriptionText({ text }: { text: string }) {
+  const urlRegex = /(https?:\/\/[^\s\)]+)/g;
+  const parts: (string | ReturnType<typeof createElement>)[] = [];
+  let last = 0;
+  let match: RegExpExecArray | null;
+  let key = 0;
+  while ((match = urlRegex.exec(text)) !== null) {
+    if (match.index > last) parts.push(text.slice(last, match.index));
+    parts.push(createElement("a", {
+      key: key++,
+      href: match[1],
+      target: "_blank",
+      rel: "noopener noreferrer",
+      style: { color: "#818cf8", textDecoration: "underline" },
+    }, match[1]));
+    last = match.index + match[1].length;
+  }
+  if (last < text.length) parts.push(text.slice(last));
+  return createElement("span", null, ...parts);
+}
+
 function TaskRow({
   task: t,
   allTasks,
   editingDraft,
+  descExpanded,
+  onToggleExpand,
   onStartEdit,
   onChangeEdit,
   onCommitEdit,
@@ -318,6 +351,8 @@ function TaskRow({
   task: Task;
   allTasks: Task[];
   editingDraft: string | undefined;
+  descExpanded: boolean;
+  onToggleExpand: () => void;
   onStartEdit: () => void;
   onChangeEdit: (v: string) => void;
   onCommitEdit: () => void;
@@ -371,9 +406,16 @@ function TaskRow({
               }, t.priority),
           ),
 
-      // description
+      // description — click to expand/collapse
       t.description && !isEditing &&
-        createElement("div", { style: styles.taskDescription }, t.description),
+        createElement("div", {
+          style: descExpanded ? styles.taskDescriptionExpanded : styles.taskDescription,
+          onClick: onToggleExpand,
+          title: descExpanded ? "Click to collapse" : "Click to expand",
+        },
+          createElement(DescriptionText, { text: t.description }),
+          !descExpanded && createElement("span", { style: styles.descMore }, " ▸"),
+        ),
 
       // blockers
       t.blockedBy.length > 0 &&
@@ -461,6 +503,7 @@ const styles: Record<string, any> = {
     color: "#e0e0e0",
     height: "100%",
     overflow: "hidden",
+    boxSizing: "border-box" as const,
   },
   empty: {
     display: "flex",
@@ -522,7 +565,7 @@ const styles: Record<string, any> = {
     flexDirection: "column",
     border: "1px solid #2a2a2a",
     borderRadius: "6px",
-    overflow: "hidden",
+    overflow: "visible",
   },
   sessionHeader: {
     display: "flex",
@@ -639,6 +682,32 @@ const styles: Record<string, any> = {
     WebkitLineClamp: 2,
     WebkitBoxOrient: "vertical",
     overflow: "hidden",
+    cursor: "pointer",
+    userSelect: "none" as const,
+  },
+  taskDescriptionExpanded: {
+    fontSize: "11px",
+    color: "#aaa",
+    marginTop: "2px",
+    lineHeight: "17px",
+    whiteSpace: "pre-wrap" as const,
+    cursor: "pointer",
+    userSelect: "text" as const,
+    backgroundColor: "#111",
+    borderRadius: "4px",
+    padding: "6px 8px",
+    border: "1px solid #2a2a2a",
+    maxHeight: "240px",
+    overflowY: "auto" as const,
+  },
+  descMore: {
+    color: "#555",
+    fontSize: "10px",
+  },
+  descLink: {
+    color: "#818cf8",
+    textDecoration: "none",
+    wordBreak: "break-all" as const,
   },
   taskMeta: { display: "flex", gap: "6px", fontSize: "11px", color: "#666", marginTop: "2px" },
   blockedTag: { color: "#ef4444", fontStyle: "italic" },
